@@ -612,24 +612,119 @@ function showTyping(on){
   }
 }
 
-function buildSystemPrompt(){
+const WEEKDAY_NAMES = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
+
+function addDays(base, n){
+  const d = new Date(base);
+  d.setDate(d.getDate() + n);
+  return d;
+}
+
+function findWeekday(text){
+  for(let i = 0; i < WEEKDAY_NAMES.length; i++){
+    if(text.includes('יום ' + WEEKDAY_NAMES[i])){
+      const now = new Date();
+      let diff = (i - now.getDay() + 7) % 7;
+      if(diff === 0) diff = 7;
+      return addDays(now, diff);
+    }
+  }
+  return null;
+}
+
+function parseDateFromText(text){
   const now = new Date();
-  const isoNow = now.toISOString();
-  const heDate = now.toLocaleDateString('he-IL', {weekday:'long', day:'numeric', month:'long', year:'numeric'});
-  const heTime = now.toLocaleTimeString('he-IL', {hour:'2-digit', minute:'2-digit'});
-  const activeReminders = state.reminders.filter(r => !r.done);
+  if(text.includes('מחרתיים')) return addDays(now, 2);
+  if(text.includes('מחר')) return addDays(now, 1);
+  if(text.includes('היום')) return now;
+  const wd = findWeekday(text);
+  if(wd) return wd;
+  let m = text.match(/בעוד\s*(\d+)\s*ימים/);
+  if(m) return addDays(now, parseInt(m[1], 10));
+  m = text.match(/בעוד\s*(\d+)\s*שבוע/);
+  if(m) return addDays(now, parseInt(m[1], 10) * 7);
+  return null;
+}
 
-  return `את/ה עוזר/ת אישי/ת דובר/ת עברית, שעוזר/ת לנהל תזכורות, משימות ולוח זמנים בתוך צ'אט.
-התאריך והשעה כרגע: ${heDate}, שעה ${heTime} (ISO: ${isoNow}).
-רשימת התזכורות הפעילות הקיימות (JSON): ${JSON.stringify(activeReminders)}
+function parseTimeFromText(text){
+  let m = text.match(/(\d{1,2}):(\d{2})/);
+  if(m) return { h: parseInt(m[1], 10), mnt: parseInt(m[2], 10) };
+  m = text.match(/ב-?(\d{1,2})(?!\d)/);
+  if(m){
+    const h = parseInt(m[1], 10);
+    if(h >= 0 && h <= 23) return { h, mnt: 0 };
+  }
+  if(text.includes('בבוקר')) return { h: 9, mnt: 0 };
+  if(text.includes('אחרי הצהריים')) return { h: 16, mnt: 0 };
+  if(text.includes('בצהריים')) return { h: 13, mnt: 0 };
+  if(text.includes('בערב')) return { h: 19, mnt: 0 };
+  if(text.includes('בלילה')) return { h: 21, mnt: 0 };
+  return null;
+}
 
-כשהמשתמש מבקש לזכור/לתזכר משהו, הוסף פריט חדש ל-add. כשהוא אומר שביצע/סיים/אפשר למחוק משהו, ציין את המזהה שלו ב-complete_ids או delete_ids בהתאם. אם הוא שואל מה מתוכנן, ענה על סמך הרשימה הקיימת, גם אם אין פעולה חדשה לבצע.
-פרש תאריכים יחסיים (מחר, יום ראשון, בעוד שבוע וכו') לפי התאריך הנוכחי שסופק. אם לא צוינה שעה מדויקת, סמן allDay:true.
+function extractReminderText(original){
+  const t = original.replace(/^(תזכיר לי|תזכיר|תזכורת|זכור לי|זכור)\s*/, '').trim();
+  return t || original;
+}
 
-חשוב מאוד: החזר תשובה בפורמט JSON בלבד, ללא טקסט נוסף מסביב וללא markdown, במבנה הבא בדיוק:
-{"reply": "טקסט קצר וטבעי בעברית שיוצג למשתמש בצ'אט", "add": [{"text": "תיאור התזכורת", "datetime": "2026-09-23T09:00:00" או null, "allDay": true או false}], "complete_ids": ["id1"], "delete_ids": ["id2"]}
+function processMessage(text){
+  const trimmed = text.trim();
 
-אם אין פעולות מסוג מסוים, החזר מערך ריק עבורו. שדה reply הוא חובה תמיד. שמור על תשובות קצרות, חמות וברורות, בלי הקדמות מיותרות.`;
+  if(/מה יש לי|מה מתוכנן|מה יש להיום/.test(trimmed)){
+    const active = state.reminders.filter(r => !r.done);
+    if(active.length === 0){
+      return { reply: 'אין לך כרגע תזכורות פעילות.', add: [], complete_ids: [], delete_ids: [] };
+    }
+    const list = active
+      .slice()
+      .sort((a, b) => (a.datetime || '\uffff').localeCompare(b.datetime || '\uffff'))
+      .map(r => '- ' + r.text + (r.datetime ? ' (' + whenLabel(r) + ')' : ''))
+      .join('\n');
+    return { reply: 'הנה מה שיש לך:\n' + list, add: [], complete_ids: [], delete_ids: [] };
+  }
+
+  const isDelete = /מחק|בטל/.test(trimmed);
+  const isComplete = /סיימתי|בוצע|סמן/.test(trimmed);
+  if(isDelete || isComplete){
+    const match = state.reminders.find(r => !r.done && trimmed.includes(r.text.slice(0, 8)));
+    if(match){
+      if(isDelete) return { reply: `מחקתי: ${match.text}`, add: [], complete_ids: [], delete_ids: [match.id] };
+      return { reply: `סימנתי כבוצע: ${match.text}`, add: [], complete_ids: [match.id], delete_ids: [] };
+    }
+    return { reply: 'לא מצאתי תזכורת שמתאימה לזה. אפשר לכתוב קצת יותר במדויק?', add: [], complete_ids: [], delete_ids: [] };
+  }
+
+  const date = parseDateFromText(trimmed);
+  const time = parseTimeFromText(trimmed);
+  const reminderText = extractReminderText(text);
+
+  let datetime = null;
+  let allDay = true;
+  if(date){
+    if(time){
+      const d = new Date(date);
+      d.setHours(time.h, time.mnt, 0, 0);
+      datetime = d.toISOString();
+      allDay = false;
+    }else{
+      datetime = date.toISOString();
+      allDay = true;
+    }
+  }else if(time){
+    const d = new Date();
+    d.setHours(time.h, time.mnt, 0, 0);
+    if(d.getTime() < Date.now()) d.setDate(d.getDate() + 1);
+    datetime = d.toISOString();
+    allDay = false;
+  }
+
+  const newReminder = { text: reminderText, datetime, allDay };
+  return {
+    reply: `הוספתי תזכורת: "${reminderText}"` + (datetime ? `, ${whenLabel(newReminder)}` : ' (בלי תאריך קבוע)'),
+    add: [newReminder],
+    complete_ids: [],
+    delete_ids: []
+  };
 }
 
 function applyActions(parsed){
@@ -671,36 +766,14 @@ async function sendMessage(){
   saveState();
   showTyping(true);
 
+  await new Promise(r => setTimeout(r, 350));
+
   try{
-    const systemPrompt = buildSystemPrompt();
-    const apiMessages = state.messages.slice(-20).map(m => ({ role: m.role, content: m.content }));
-
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1000,
-        system: systemPrompt,
-        messages: apiMessages
-      })
-    });
-
-    const data = await response.json();
-    const rawText = (data.content || []).map(b => b.text || '').join('');
-    const cleaned = rawText.replace(/```json|```/g, '').trim();
-
-    let parsed;
-    try{
-      parsed = JSON.parse(cleaned);
-    }catch(e){
-      parsed = { reply: rawText || 'לא הצלחתי להבין את זה, אפשר לנסח מחדש?', add: [], complete_ids: [], delete_ids: [] };
-    }
-
+    const parsed = processMessage(text);
     applyActions(parsed);
     state.messages.push({ role: 'assistant', content: parsed.reply || 'סבבה, טופל.' });
   }catch(e){
-    state.messages.push({ role: 'assistant', content: 'משהו השתבש בשליחה. אפשר לנסות שוב?' });
+    state.messages.push({ role: 'assistant', content: 'לא הצלחתי להבין את זה. אפשר לנסח מחדש? למשל: תזכיר לי מחר ב-9 להתקשר לרופא' });
   }
 
   showTyping(false);
